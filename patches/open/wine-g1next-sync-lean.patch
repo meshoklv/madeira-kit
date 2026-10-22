@@ -1,0 +1,97 @@
+From c86a9db715cb7f7008f70fb25f4d11c144af3637 Mon Sep 17 00:00:00 2001
+From: meshoklv <119141917+meshoklv@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 04:41:54 +0000
+Subject: [PATCH] ntdll: MADEIRA_SYNC_LEAN drops SRW history ring and
+ WaitOnAddress counters (exp, off by default)
+
+DS3 G1 log (21.10.2026): ~190k SRW releases/s (wake1 55k/s + wakeAll 137k/s)
+from up to 8 threads; every acquire/release bumped one process-wide
+counter (ios_srw_ring_idx) and every WaitOnAddress/wake one more
+(ios_xp_nt.woa_*). env.MADEIRA_SYNC_LEAN=1 skips both; locking is unchanged.
+Read once in madeira_x64_fastpath_install, logs [sync-lean].
+
+Signed-off-by: meshoklv <119141917+meshoklv@users.noreply.github.com>
+---
+ dlls/ntdll/cs_x64_fastpath.c | 10 ++++++++++
+ dlls/ntdll/sync.c            | 19 +++++++++++++++----
+ 2 files changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/ntdll/cs_x64_fastpath.c b/dlls/ntdll/cs_x64_fastpath.c
+index 2abc7a60..660ef01d 100644
+--- a/dlls/ntdll/cs_x64_fastpath.c
++++ b/dlls/ntdll/cs_x64_fastpath.c
+@@ -249,8 +249,18 @@ static void x64_fp_fill_slot( BYTE *stub, unsigned int slot, void *target )
+     memcpy( stub + slot, &target, sizeof(target) );
+ }
+ 
++extern BOOL ios_sync_lean;   /* sync.c, madeira-g1next */
++
+ static void madeira_x64_fastpath_install(void)
+ {
++    /* madeira-g1next: env.MADEIRA_SYNC_LEAN = 1 -- no SRW history ring, no WaitOnAddress counters
++     * (sync.c). Default off. Read here because this runs once, early, in every 64-bit process. */
++    if (flag( L"MADEIRA_SYNC_LEAN", false ))
++    {
++        ios_sync_lean = TRUE;
++        ERR( "[sync-lean] madeira-g1next MADEIRA_SYNC_LEAN=1: SRW history ring and WaitOnAddress counters off\n" );
++    }
++
+     /* madeira-bcd: x64 fast path for EnterCriticalSection/LeaveCriticalSection/TryEnterCriticalSection.
+      * Default off (experimental). 1: an uncontended or recursive critical section is taken and
+      * released inside the x64 JIT code instead of a round trip into native ntdll (~100 cycles each,
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index 2f668967..274a58af 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -892,9 +892,20 @@ struct ios_srw_ring_ent { const void *lock; ULONG tid_mode; };
+ static struct ios_srw_ring_ent ios_srw_ring[512];
+ static LONG ios_srw_ring_idx;
+ static const char * const ios_srw_mode_name[4] = { "acqX", "relX", "acqS", "relS" };
++/* madeira-g1next (21.10.2026): env.MADEIRA_SYNC_LEAN = 1 (default off, read once at process start in
++ * madeira_x64_fastpath_install, loader.c) drops the diagnostic bookkeeping on the SRW lock and
++ * WaitOnAddress hot paths: the SRW history ring below (one interlocked increment on a single
++ * process-wide counter per acquire/release) and the [xp-api] WaitOnAddress/wake1/wakeAll counters.
++ * DS3 G1: ~190k SRW releases/s (wake1 55k + wakeAll 137k) from up to 8 threads on P and E cores,
++ * i.e. ~0.5M increments/s of a few shared cache lines. Costs: [srw] park dumps lose their holder
++ * history, [xp-api] shows WaitOnAddress/wake1/wakeAll as 0. Locking itself is unchanged. */
++BOOL ios_sync_lean = FALSE;
++
+ static void ios_srw_note( const void *lock, unsigned int mode )
+ {
+-    ULONG i = (ULONG)InterlockedIncrement( &ios_srw_ring_idx );
++    ULONG i;
++    if (ios_sync_lean) return;
++    i = (ULONG)InterlockedIncrement( &ios_srw_ring_idx );
+     ios_srw_ring[i & 511].lock = lock;
+     ios_srw_ring[i & 511].tid_mode =
+         (HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) << 2) | mode;
+@@ -1358,7 +1369,7 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
+     NTSTATUS ret;
+ 
+     TRACE("addr %p cmp %p size %#Ix timeout %s\n", addr, cmp, size, debugstr_timeout( timeout ));
+-    InterlockedIncrement64( &ios_xp_nt.woa_waits );   /* ml1131 */
++    if (!ios_sync_lean) InterlockedIncrement64( &ios_xp_nt.woa_waits );   /* ml1131; madeira-g1next */
+ 
+     if (size != 1 && size != 2 && size != 4 && size != 8)
+         return STATUS_INVALID_PARAMETER;
+@@ -1435,7 +1446,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
+     unsigned int count = 0;
+     HANDLE tids[256];
+ 
+-    InterlockedIncrement64( &ios_xp_nt.woa_wake_all );   /* ml1131 */
++    if (!ios_sync_lean) InterlockedIncrement64( &ios_xp_nt.woa_wake_all );   /* ml1131; madeira-g1next */
+ 
+     TRACE("%p\n", addr);
+ 
+@@ -1478,7 +1489,7 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
+     struct futex_entry *entry;
+     DWORD tid = 0;
+ 
+-    InterlockedIncrement64( &ios_xp_nt.woa_wake_single );   /* ml1131 */
++    if (!ios_sync_lean) InterlockedIncrement64( &ios_xp_nt.woa_wake_single );   /* ml1131; madeira-g1next */
+ 
+     TRACE("%p\n", addr);
+ 
+-- 
+2.43.0
+

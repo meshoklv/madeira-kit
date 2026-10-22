@@ -1,0 +1,19 @@
+# local config / identifiers
+scripts/config.env
+*.mobileprovision
+*.p12
+*.cer
+*.env
+# builds, game files, saves, logs
+builds/
+work/
+logs/
+*.ipa
+*.zip
+*.exe
+*.dll
+*.sl2
+*.co2
+saves/
+__pycache__/
+.DS_Store

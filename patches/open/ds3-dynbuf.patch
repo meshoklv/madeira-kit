@@ -1,0 +1,19 @@
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -5079,9 +5079,14 @@
+     if (orphan_mode < 0)
+     {
+         const char *e = getenv( "MADEIRA_LOCK_ORPHAN" );
+-        orphan_mode = !e ? 0 : !strcmp( e, "stamped" ) ? 1 : !strcmp( e, "0" ) ? 2 : 0;
++        /* DS3 (dxmt DynamicBuffer::mutex_, 2026-10-20) and HZD (build 479): the
++         * legacy mode strikes once per parked WAITER, so any busy SRW lock with
++         * >=3 waiters is force-released in a single monitor pass while its
++         * owner is alive -> two threads inside one critical section.  Default
++         * to "stamped"; MADEIRA_LOCK_ORPHAN=legacy restores the old behaviour. */
++        orphan_mode = !e ? 1 : !strcmp( e, "stamped" ) ? 1 : !strcmp( e, "0" ) ? 2 : !strcmp( e, "legacy" ) ? 0 : 1;
+         if (orphan_mode)
+-            dprintf( 2, "[lock-orphan] madeira-bcd MADEIRA_LOCK_ORPHAN=%s: %s\n", e,
++            dprintf( 2, "[lock-orphan] madeira-bcd MADEIRA_LOCK_ORPHAN=%s: %s\n", e ? e : "(unset, default)",
+                      orphan_mode == 1 ? "only locks a live thread has stamped are released, after 3 monitor cycles"
+                                       : "no orphan-lock releases" );
+     }

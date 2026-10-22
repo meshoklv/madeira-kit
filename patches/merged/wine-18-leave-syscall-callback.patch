@@ -1,0 +1,42 @@
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 9b4ceac2f10..7ce542c35fc 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -2107,7 +2107,21 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
+     NTSTATUS status;
+ 
+     if (!enter_syscall_callback())
++    {
++        /* ml1136: this bypass skips pNotifyMemoryProtect, so FEX never learns about the
++         * new protection. Log exec requests that take it: silence here now means the
++         * emulator saw every executable protect. */
++        static int bypass_n;
++        const ULONG bypass_exec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
++
++        if ((new_prot & bypass_exec) && bypass_n < 32)
++        {
++            bypass_n++;
++            ERR( "[protect-bypass] ml1136 #%d addr=%p size=%p new_prot=%lx -- InSyscallCallback already set, FEX NOT notified\n",
++                 bypass_n, *addr_ptr, (void *)*size_ptr, new_prot );
++        }
+         return syscall_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
++    }
+ 
+     if (!is_current) send_cross_process_notification( process, CrossProcessPreVirtualProtect,
+                                                       *addr_ptr, *size_ptr, 2, new_prot, 0 );
+@@ -2190,6 +2204,15 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
+             else if (pNotifyMemoryProtect
+                      && !ios_bulk_protect_suppressed( "cur-post", *addr_ptr, *size_ptr, new_prot ))
+                 pNotifyMemoryProtect( *addr_ptr, *size_ptr, new_prot, TRUE, st );
++            /* ml1136 ROOT-CAUSE FIX: this early return skipped leave_syscall_callback(), so
++             * InSyscallCallback stayed set after every logged exec request. Every later
++             * NtProtect/NtAllocate/NtFree/NtMapViewOfSection on the thread then took the
++             * enter_syscall_callback() bypass and never reached FEX. Seen on DSR: map-gate
++             * insc_before=0 right before [exec-req] #1, insc_before=1 right after; after
++             * [exec-req] #5 the guest's PAGE_EXECUTE_READWRITE on .tls..end reached Wine
++             * (VirtualQuery protect=0x80) but not FEX (no "Add SMC interval", xquery MISS),
++             * and the first branch into it decoded as NOEXEC -> c0000005 at 0x141e5e7cd. */
++            leave_syscall_callback();
+             return st;
+         }
+     }

@@ -1,0 +1,6 @@
+{
+  "name": "madeira-kit",
+  "description": "Guide and tooling for running heavy Windows x64 games on iPhone via Madeira (FEX-Emu + Wine + DXMT): signing, configs, FPS reports.",
+  "homepage": "",
+  "topics": ["madeira", "ios", "iphone", "wine", "fex-emu", "dxmt", "emulation", "performance", "dark-souls", "tooling"]
+}

@@ -1,0 +1,217 @@
+From 9d1293f4fd97cdd1402b67eea1f25275d0adfcae Mon Sep 17 00:00:00 2001
+From: meshoklv <119141917+meshoklv@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 04:42:14 +0000
+Subject: [PATCH] d3d11: keep retired dynamic-buffer names and command-list CPU
+ blocks (exp, off by default)
+
+DS3 G1 log (21.10.2026): 15-30k fresh MTLBuffers/s for dynamic buffer
+renames (avg 438 bytes; the 64-entry trim frees what the next frame needs)
+and ~960 malloc/free of the 2 MB command-list CPU block per second.
+
+- DXMT_DYN_KEEP=<n> (+DXMT_DYN_KEEP_KB, default 4096): keep up to
+  max(64, min(n, KB*1024/length)) retired names, O(dropped) trim, no census walk.
+- DXMT_CMDLIST_KEEP_BLOCK=1: a recycled command list keeps its first 2 MB block.
+- DXMT_CENSUS_THROTTLE also limits [bc-stream] to one line per 10 s.
+
+Signed-off-by: meshoklv <119141917+meshoklv@users.noreply.github.com>
+---
+ src/d3d11/d3d11_context_impl.cpp      | 38 +++++++++++++++-
+ src/dxmt/dxmt_dynamic.cpp             | 63 +++++++++++++++++++++++++++
+ src/dxmt/dxmt_ring_bump_allocator.hpp | 28 ++++++++++++
+ 3 files changed, 128 insertions(+), 1 deletion(-)
+
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index dad0577..5ca4936 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -9,6 +9,8 @@ since it is for internal use only
+ #include "Metal.hpp"
+ #include "config/config.hpp"   /* ml869 */
+ #include <deque>   /* ml1256 */
++#include <chrono>   /* madeira-g1next */
++#include <string>   /* madeira-g1next */
+ #include "d3d11_annotation.hpp"
+ #include "d3d11_context.hpp"
+ #include "d3d11_device_child.hpp"
+@@ -631,6 +633,23 @@ inline void BCStreamReport() {
+   static std::atomic<uint32_t> tick{0};
+   if ((tick.fetch_add(1, std::memory_order_relaxed) & 0x3FF) != 0)
+     return;
++  /* madeira-g1next: with DXMT_CENSUS_THROTTLE on, the report (one formatted ERR line per
++   * 1024 UpdateSubresource calls -- ~50 lines/s on DS3's render threads) is cut to one
++   * per 10 s, like [mem-census]. */
++  {
++    static const bool throttle = madeiraSwitch("DXMT_CENSUS_THROTTLE");
++    if (throttle) {
++      static std::atomic<uint64_t> last_ns{0};
++      const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
++                               std::chrono::steady_clock::now().time_since_epoch())
++                               .count();
++      uint64_t prev = last_ns.load(std::memory_order_relaxed);
++      if (prev && now - prev < 10ull * 1000 * 1000 * 1000)
++        return;
++      if (!last_ns.compare_exchange_strong(prev, now, std::memory_order_relaxed))
++        return;
++    }
++  }
+   static const char *const kName[16] = {"?","BC1","BC2","BC3","BC4u","BC5u","?","BC7",
+                                         "?","?","?","?","?","?","BC4s","BC5s"};
+   uint32_t total = 0;
+@@ -5847,6 +5866,18 @@ struct used_dynamic_lineartexture {
+   bool latest;
+ };
+ 
++inline bool
++cmdlistKeepBlock() {
++  static const bool on = [] {
++    const std::string v = env::getEnvVar("DXMT_CMDLIST_KEEP_BLOCK");
++    const bool r = !v.empty() && v != "0";
++    if (r)
++      ERR("[cmdlist-keep] madeira-g1next DXMT_CMDLIST_KEEP_BLOCK=", v, " (command lists keep their first 2 MB CPU block)");
++    return r;
++  }();
++  return on;
++}
++
+ class MTLD3D11CommandList : public ManagedDeviceChild<ID3D11CommandList> {
+ public:
+   MTLD3D11CommandList(MTLD3D11Device *pDevice, MTLD3D11CommandListPoolBase *pPool, UINT context_flag) :
+@@ -5888,7 +5919,12 @@ public:
+     issued_event_query.clear();
+     list.reset();
+     staging_allocator.free_blocks(~0uLL);
+-    cpu_command_allocator.free_blocks(~0uLL);
++    /* madeira-g1next: DXMT_CMDLIST_KEEP_BLOCK=1 keeps this list's first 2 MB CPU command
++     * block across recycles (see RingBumpState::free_blocks_keep_first). Unset/0: as before. */
++    if (cmdlistKeepBlock())
++      cpu_command_allocator.free_blocks_keep_first();
++    else
++      cpu_command_allocator.free_blocks(~0uLL);
+ 
+     promote_flush = false;
+   };
+diff --git a/src/dxmt/dxmt_dynamic.cpp b/src/dxmt/dxmt_dynamic.cpp
+index dafa85f..adebf77 100644
+--- a/src/dxmt/dxmt_dynamic.cpp
++++ b/src/dxmt/dxmt_dynamic.cpp
+@@ -1,8 +1,52 @@
+ #include "dxmt_dynamic.hpp"
+ #include "dxmt_texture.hpp"
+ #include "dxmt_mem_census.hpp"
++#include "util_env.hpp"
++#include "log/log.hpp"
++#include <algorithm>
++#include <cstdlib>
++#include <string>
+ 
+ namespace dxmt {
++
++/* madeira-g1next (21.10.2026, DS3): DXMT_DYN_KEEP = <entries>, default unset/0 = off.
++ *
++ * Off, a DynamicBuffer keeps at most DYN_KEEP_ELIGIBLE (64) retired names. A constant
++ * buffer that the game renames once per draw (DS3: ~600 draws a frame) retires ~600
++ * names a frame; as soon as the GPU catches up, the trim below frees all but 64, and
++ * the next frame mints ~540 brand-new Metal buffers for it again. G1 log 21.10:
++ * 15-30k fresh MTLBuffers a second (~1000 a frame, avg 438 bytes), each a newBuffer
++ * plus a release on the game's own render threads.
++ *
++ * On, an instance keeps up to max(64, min(DXMT_DYN_KEEP, DXMT_DYN_KEEP_KB*1024/length))
++ * retired names (DXMT_DYN_KEEP_KB default 4096): a 256-byte constant buffer keeps up to
++ * DXMT_DYN_KEEP, a 64 KB buffer still 64. The O(depth) census walk (ml681 per-instance
++ * statistics) is skipped in this mode -- with ~1000 retained names it would cost more
++ * than it measures; [dyn-census] then shows stale per-instance rows, [trim] and
++ * "dynamic recycle" totals stay exact. */
++static uint32_t
++dynKeepFor(uint64_t length) {
++  static const uint32_t keep_n = [] {
++    const std::string v = env::getEnvVar("DXMT_DYN_KEEP");
++    long n = v.empty() ? 0 : std::strtol(v.c_str(), nullptr, 0);
++    if (n < 0) n = 0;
++    if (n > 65536) n = 65536;
++    if (n)
++      ERR("[dyn-keep] madeira-g1next DXMT_DYN_KEEP=", n, " (retired names kept per dynamic buffer)");
++    return (uint32_t)n;
++  }();
++  static const uint64_t budget = [] {
++    const std::string v = env::getEnvVar("DXMT_DYN_KEEP_KB");
++    long kb = v.empty() ? 4096 : std::strtol(v.c_str(), nullptr, 0);
++    if (kb < 0) kb = 0;
++    return (uint64_t)kb * 1024;
++  }();
++  if (!keep_n)
++    return 0;
++  uint64_t by_bytes = length ? budget / length : keep_n;
++  uint64_t k = std::min<uint64_t>(keep_n, by_bytes);
++  return (uint32_t)std::max<uint64_t>(k, 64);
++}
+ DynamicBuffer::DynamicBuffer(Buffer *buffer, Flags<BufferAllocationFlag> flags) :
+     buffer(buffer),
+     flags_(flags),
+@@ -61,6 +105,25 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
+    *
+    * The walk and the trim now run for EVERY instance; only the statistics are
+    * gated. Behaviour must never depend on diagnostic capacity. */
++  if (const uint32_t keep = dynKeepFor(buffer ? buffer->length() : 0)) {
++    /* madeira-g1next DXMT_DYN_KEEP: fifo is in non-decreasing will_free_at order, so
++     * dropping from the front while the front is GPU-complete never touches a fenced
++     * entry; O(dropped), no walk. */
++    uint64_t freed = 0, freed_n = 0;
++    while (fifo.size() > keep && fifo.front().will_free_at <= coherent_seq_id) {
++      const QueueEntry &f = fifo.front();
++      freed += f.allocation.ptr() ? f.allocation->census_bytes_ : 0;
++      freed_n++;
++      fifo.pop_front();
++    }
++    if (freed_n) {
++      trimmed_last_ = true;
++      g_trim_total_n.fetch_add(freed_n, std::memory_order_relaxed);
++      g_trim_total_bytes.fetch_add(freed, std::memory_order_relaxed);
++    }
++    if (census_id_ < DYN_CENSUS_SLOTS)
++      g_dyn_stats[census_id_].depth.store(fifo.size(), std::memory_order_relaxed);
++  } else
+   {
+     const bool stats = census_id_ < DYN_CENSUS_SLOTS;
+     uint64_t en = 0, eb = 0, in_n = 0, in_b = 0, lo = ~0ull, hi = 0, dup = 0;
+diff --git a/src/dxmt/dxmt_ring_bump_allocator.hpp b/src/dxmt/dxmt_ring_bump_allocator.hpp
+index 626b7b5..d39d27e 100644
+--- a/src/dxmt/dxmt_ring_bump_allocator.hpp
++++ b/src/dxmt/dxmt_ring_bump_allocator.hpp
+@@ -165,6 +165,34 @@ public:
+ 
+   void free_blocks(uint64_t coherent_id);
+ 
++  /* madeira-g1next (DXMT_CMDLIST_KEEP_BLOCK): free_blocks(~0) for a ring whose every
++   * pointer is dead (a recycled command list), except that the first block survives,
++   * emptied, when it has the ring's normal size. MTLD3D11CommandList::Reset used to
++   * free a 2 MB malloc'd block per command list and the next recording malloc'd a new
++   * one: in DS3 ~960 a second, each a fresh NtAllocateVirtualMemory (heap "large
++   * block"), first-touch faults and an NtFreeVirtualMemory that makes FEX invalidate
++   * the 2 MB range on every guest thread under its global code lock. */
++  void
++  free_blocks_keep_first() {
++    std::lock_guard<mutex> lock(mutex_);
++    if (fifo.empty())
++      return;
++    Allocation first = std::move(fifo.front());
++    fifo.pop();
++    while (!fifo.empty()) {
++      if (fifo.front().reusable_oversize) --reusable_oversize_blocks_;
++      fifo.pop();
++    }
++    if (first.total_size == ring_block_size() && !first.reusable_oversize) {
++      first.allocated_size = 0;
++      first.last_used_seq_id = 0;
++      first.inc_time_to_live = 0;
++      fifo.push(std::move(first));
++    } else if (first.reusable_oversize) {
++      --reusable_oversize_blocks_;
++    }
++  }
++
+ private:
+   struct Allocation {
+     size_t allocated_size;
+-- 
+2.43.0
+
